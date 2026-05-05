@@ -324,20 +324,22 @@ class CellWidget(QFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Test Module tab  (multi-port)
+#  Test Module tab  (original single-port style + balance tab integration)
 # ═══════════════════════════════════════════════════════════════════════════════
 class TestTab(QWidget):
-    # columns in the live table
-    LIVE_COLS = ["Port", "HW Addr", "C1", "C2", "C3", "C4", "C5", "C6",
-                 "Spread mV", "Avg V", "Module V", "Temp1 °C", "Temp2 °C", "Label", "Serial"]
-
     def __init__(self, parent=None):
         super().__init__(parent)
-        # keyed by (port, addr) → {data, label, serial}
+        self._worker: BMBWorker | None = None
+        self._last_data: dict | None = None
+        # shared module state for BalanceTab — keyed by (port, addr)
         self._modules: dict[tuple, dict] = {}
-        # keyed by port → BMBWorker
-        self._workers: dict[str, BMBWorker] = {}
         self._build_ui()
+
+    def get_workers(self) -> dict[str, BMBWorker]:
+        return {self._worker.port: self._worker} if self._worker else {}
+
+    def get_modules(self) -> dict[tuple, dict]:
+        return self._modules
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -345,14 +347,11 @@ class TestTab(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
 
         # ── Connection bar ────────────────────────────────────────────────────
-        conn_box = QGroupBox("Connection  (Ctrl+click to select multiple ports)")
+        conn_box = QGroupBox("Connection")
         conn_lay = QHBoxLayout(conn_box)
 
-        from PyQt6.QtWidgets import QListWidget, QAbstractItemView
-        self.lst_ports = QListWidget()
-        self.lst_ports.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        self.lst_ports.setMaximumHeight(80)
-        self.lst_ports.setMinimumWidth(320)
+        self.cmb_port = QComboBox()
+        self.cmb_port.setMinimumWidth(120)
         self._refresh_ports()
 
         btn_refresh = QPushButton("↻")
@@ -360,164 +359,188 @@ class TestTab(QWidget):
         btn_refresh.setToolTip("Refresh port list")
         btn_refresh.clicked.connect(self._refresh_ports)
 
-        self.btn_connect = QPushButton("Connect All")
+        self.btn_connect = QPushButton("Connect")
         self.btn_connect.setCheckable(True)
         self.btn_connect.clicked.connect(self._toggle_connect)
-        self.btn_connect.setMinimumWidth(110)
+        self.btn_connect.setMinimumWidth(90)
 
-        self.lbl_status = QLabel("Not connected")
-        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_hw_addr = QLabel("HW addr: —")
+        self.lbl_hw_addr.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        conn_lay.addWidget(QLabel("Ports:"))
-        conn_lay.addWidget(self.lst_ports)
+        conn_lay.addWidget(QLabel("Port:"))
+        conn_lay.addWidget(self.cmb_port)
         conn_lay.addWidget(btn_refresh)
         conn_lay.addSpacing(16)
         conn_lay.addWidget(self.btn_connect)
         conn_lay.addSpacing(16)
-        conn_lay.addWidget(self.lbl_status)
+        conn_lay.addWidget(self.lbl_hw_addr)
         conn_lay.addStretch()
 
         root.addWidget(conn_box)
 
-        # ── Live module table ─────────────────────────────────────────────────
-        live_box = QGroupBox("Live Readings")
-        live_lay = QVBoxLayout(live_box)
+        # ── Module identity ───────────────────────────────────────────────────
+        id_box = QGroupBox("Module Identity")
+        id_lay = QHBoxLayout(id_box)
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(len(self.LIVE_COLS))
-        self.table.setHorizontalHeaderLabels(self.LIVE_COLS)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setAlternatingRowColors(True)
-        # allow editing label/serial inline via double-click on those columns
-        self.table.setEditTriggers(
-            QTableWidget.EditTrigger.DoubleClicked |
-            QTableWidget.EditTrigger.SelectedClicked
-        )
-        self.table.itemChanged.connect(self._on_table_edit)
-        live_lay.addWidget(self.table)
+        self.txt_label = QLineEdit()
+        self.txt_label.setPlaceholderText("e.g. M05  or  spare-1")
+        self.txt_label.setMinimumWidth(130)
 
-        # Save row button
-        btn_row = QHBoxLayout()
-        self.btn_save_sel = QPushButton("💾  Save Selected to Log")
-        self.btn_save_sel.setEnabled(False)
-        self.btn_save_sel.setMinimumHeight(36)
-        self.btn_save_sel.clicked.connect(self._save_selected)
+        self.txt_serial = QLineEdit()
+        self.txt_serial.setPlaceholderText("serial / part number (optional)")
+        self.txt_serial.setMinimumWidth(200)
 
-        self.btn_save_all = QPushButton("💾  Save All to Log")
-        self.btn_save_all.setEnabled(False)
-        self.btn_save_all.setMinimumHeight(36)
-        self.btn_save_all.clicked.connect(self._save_all)
+        id_lay.addWidget(QLabel("Label:"))
+        id_lay.addWidget(self.txt_label)
+        id_lay.addSpacing(20)
+        id_lay.addWidget(QLabel("Serial / Notes:"))
+        id_lay.addWidget(self.txt_serial)
+        id_lay.addStretch()
 
-        btn_row.addStretch()
-        btn_row.addWidget(self.btn_save_sel)
-        btn_row.addWidget(self.btn_save_all)
-        live_lay.addLayout(btn_row)
+        root.addWidget(id_box)
 
-        root.addWidget(live_box)
+        # ── Cell voltage grid ─────────────────────────────────────────────────
+        cells_box = QGroupBox("Cell Voltages")
+        cells_lay = QHBoxLayout(cells_box)
+        cells_lay.setSpacing(8)
+
+        self.cell_widgets = []
+        for i in range(1, 7):
+            cw = CellWidget(i)
+            self.cell_widgets.append(cw)
+            cells_lay.addWidget(cw)
+
+        root.addWidget(cells_box)
+
+        # ── Module stats ──────────────────────────────────────────────────────
+        stats_box = QGroupBox("Module Stats")
+        stats_lay = QHBoxLayout(stats_box)
+        stats_lay.setSpacing(30)
+
+        def stat_pair(label):
+            lbl = QLabel(label + ":")
+            val = QLabel("—")
+            f = val.font()
+            f.setPointSize(13)
+            f.setBold(True)
+            val.setFont(f)
+            return lbl, val
+
+        lbl_mv, self.lbl_mod_v  = stat_pair("Pack V")
+        lbl_sp, self.lbl_spread = stat_pair("Spread")
+        lbl_t1, self.lbl_temp1  = stat_pair("Temp 1")
+        lbl_t2, self.lbl_temp2  = stat_pair("Temp 2")
+        lbl_av, self.lbl_avg    = stat_pair("Avg Cell")
+
+        for lbl, val in [(lbl_mv, self.lbl_mod_v), (lbl_sp, self.lbl_spread),
+                         (lbl_t1, self.lbl_temp1), (lbl_t2, self.lbl_temp2),
+                         (lbl_av, self.lbl_avg)]:
+            pair = QVBoxLayout()
+            pair.addWidget(lbl)
+            pair.addWidget(val)
+            stats_lay.addLayout(pair)
+
+        stats_lay.addStretch()
+
+        self.btn_save = QPushButton("💾  Save Reading to Log")
+        self.btn_save.setEnabled(False)
+        self.btn_save.setMinimumHeight(40)
+        self.btn_save.setMinimumWidth(180)
+        self.btn_save.clicked.connect(self._save_reading)
+        stats_lay.addWidget(self.btn_save)
+
+        root.addWidget(stats_box)
+        root.addStretch()
 
     # ── Ports ─────────────────────────────────────────────────────────────────
     def _refresh_ports(self):
-        self.lst_ports.clear()
+        self.cmb_port.clear()
         ports = serial.tools.list_ports.comports()
         for p in ports:
-            from PyQt6.QtWidgets import QListWidgetItem
-            item = QListWidgetItem(f"{p.device}  {p.description[:50]}")
-            item.setData(Qt.ItemDataRole.UserRole, p.device)
-            self.lst_ports.addItem(item)
+            self.cmb_port.addItem(f"{p.device}  {p.description[:40]}", p.device)
         if not ports:
-            from PyQt6.QtWidgets import QListWidgetItem
-            self.lst_ports.addItem(QListWidgetItem("No ports found"))
-
-    def _selected_ports(self) -> list[str]:
-        ports = []
-        for item in self.lst_ports.selectedItems():
-            p = item.data(Qt.ItemDataRole.UserRole)
-            if p:
-                ports.append(p)
-        return ports
+            self.cmb_port.addItem("No ports found", "")
 
     # ── Connect / disconnect ──────────────────────────────────────────────────
     def _toggle_connect(self, checked: bool):
         if checked:
-            ports = self._selected_ports()
-            if not ports:
+            port = self.cmb_port.currentData()
+            if not port:
                 self.btn_connect.setChecked(False)
-                QMessageBox.warning(self, "No Port Selected",
-                                    "Select at least one port from the list.")
                 return
-            self.btn_connect.setText("Disconnect All")
-            for port in ports:
-                self._start_worker(port)
+            self._start_worker(port)
+            self.btn_connect.setText("Disconnect")
         else:
-            self._stop_all_workers()
-            self.btn_connect.setText("Connect All")
-            self.lbl_status.setText("Not connected")
+            self._stop_worker()
+            self.btn_connect.setText("Connect")
+            self.lbl_hw_addr.setText("HW addr: —")
             self._modules.clear()
-            self.table.setRowCount(0)
-            self.btn_save_sel.setEnabled(False)
-            self.btn_save_all.setEnabled(False)
-
-    def get_workers(self) -> dict[str, BMBWorker]:
-        return self._workers
-
-    def get_modules(self) -> dict[tuple, dict]:
-        return self._modules
+            for cw in self.cell_widgets:
+                cw.clear()
 
     def _start_worker(self, port: str):
-        if port in self._workers:
-            return
-        w = BMBWorker(port)
-        w.data_ready.connect(self._on_data)
-        w.status_msg.connect(self._on_status)
-        w.connect_done.connect(self._on_connected)
-        w.error.connect(self._on_error)
-        w.balancing_changed.connect(self._on_balancing_changed)
-        self._workers[port] = w
-        w.start()
+        self._worker = BMBWorker(port)
+        self._worker.data_ready.connect(self._on_data)
+        self._worker.status_msg.connect(self._on_status)
+        self._worker.connect_done.connect(self._on_connected)
+        self._worker.error.connect(self._on_error)
+        self._worker.balancing_changed.connect(self._on_balancing_changed)
+        self._worker.start()
+
+    def _stop_worker(self):
+        if self._worker:
+            self._worker.stop()
+            self._worker.wait(3000)
+            self._worker = None
+        self.btn_save.setEnabled(False)
+
+    # ── Signals from worker ───────────────────────────────────────────────────
+    def _on_connected(self, port: str, addrs: list[int]):
+        self.lbl_hw_addr.setText(f"HW addr: {addrs}")
+        self.btn_save.setEnabled(True)
+        if self.txt_label.text() == "" and addrs:
+            self.txt_label.setText(f"addr{addrs[0]}")
+
+    def _on_data(self, port: str, data: dict):
+        self._last_data = data
+        cells = data["cells"]
+        mean  = sum(cells) / len(cells)
+
+        for cw, v in zip(self.cell_widgets, cells):
+            cw.update_value(v, (v - mean) * 1000)
+
+        spread_mv = (max(cells) - min(cells)) * 1000
+        spread_color = "#e53935" if spread_mv > SPREAD_WARN else "#43a047"
+        self.lbl_spread.setText(f"{spread_mv:.1f} mV")
+        self.lbl_spread.setStyleSheet(f"color: {spread_color};")
+        self.lbl_mod_v.setText(f"{data['module_v']:.3f} V")
+        self.lbl_avg.setText(f"{mean:.4f} V")
+
+        t1, t2 = data["temp1"], data["temp2"]
+        self.lbl_temp1.setText("—" if math.isnan(t1) else f"{t1:.1f} °C")
+        self.lbl_temp2.setText("—" if math.isnan(t2) else f"{t2:.1f} °C")
+
+        # keep shared state for BalanceTab
+        key = (port, data["hw_addr"])
+        existing = self._modules.get(key, {})
+        self._modules[key] = {
+            "port":     port,
+            "data":     data,
+            "label":    self.txt_label.text().strip() or existing.get("label", f"addr{data['hw_addr']}"),
+            "serial":   self.txt_serial.text().strip() or existing.get("serial", ""),
+            "bal_mask": existing.get("bal_mask", 0),
+        }
+        main = self.window()
+        if hasattr(main, "balance_tab"):
+            main.balance_tab.refresh_row(port, data["hw_addr"])
 
     def _on_balancing_changed(self, port: str, addr: int, mask: int):
         key = (port, addr)
         if key in self._modules:
             self._modules[key]["bal_mask"] = mask
-        # notify balance tab if present
         main = self.window()
         if hasattr(main, "balance_tab"):
             main.balance_tab.on_balancing_changed(port, addr, mask)
-
-    def _stop_all_workers(self):
-        for w in self._workers.values():
-            w.stop()
-            w.wait(3000)
-        self._workers.clear()
-        self.btn_save_sel.setEnabled(False)
-        self.btn_save_all.setEnabled(False)
-
-    # ── Signals from workers ──────────────────────────────────────────────────
-    def _on_connected(self, port: str, addrs: list[int]):
-        connected = sum(len(w.addrs) for w in self._workers.values())
-        self.lbl_status.setText(
-            f"{len(self._workers)} port(s) — {connected} module(s) found"
-        )
-        self.btn_save_sel.setEnabled(True)
-        self.btn_save_all.setEnabled(True)
-
-    def _on_data(self, port: str, data: dict):
-        key = (port, data["hw_addr"])
-        existing = self._modules.get(key, {})
-        self._modules[key] = {
-            "port":    port,
-            "data":    data,
-            "label":   existing.get("label", f"{port}-addr{data['hw_addr']}"),
-            "serial":  existing.get("serial", ""),
-            "bal_mask": existing.get("bal_mask", 0),
-        }
-        self._refresh_table()
-        main = self.window()
-        if hasattr(main, "balance_tab"):
-            main.balance_tab.refresh_row(port, data["hw_addr"])
 
     def _on_status(self, msg: str):
         window = self.window()
@@ -525,139 +548,46 @@ class TestTab(QWidget):
             window.statusBar().showMessage(msg, 5000)
 
     def _on_error(self, port: str, msg: str):
-        self._workers.pop(port, None)
-        if not self._workers:
-            self.btn_connect.setChecked(False)
-            self.btn_connect.setText("Connect All")
+        self.btn_connect.setChecked(False)
+        self.btn_connect.setText("Connect")
+        self._stop_worker()
         QMessageBox.critical(self, "Connection Error", msg)
 
-    # ── Table rendering ───────────────────────────────────────────────────────
-    def _refresh_table(self):
-        self.table.blockSignals(True)
-        keys = list(self._modules.keys())
-        self.table.setRowCount(len(keys))
-
-        # compute overall cell mean across all modules for deviation colouring
-        all_cells = []
-        for entry in self._modules.values():
-            all_cells.extend(entry["data"]["cells"])
-        global_mean = sum(all_cells) / len(all_cells) if all_cells else 0.0
-
-        for row_i, key in enumerate(keys):
-            entry = self._modules[key]
-            data  = entry["data"]
-            cells = data["cells"]
-            mean  = sum(cells) / len(cells)
-            spread_mv = (max(cells) - min(cells)) * 1000
-            t1, t2 = data["temp1"], data["temp2"]
-
-            def cell_item(text):
-                it = QTableWidgetItem(str(text))
-                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                return it
-
-            col_vals = [
-                entry["port"],
-                str(data["hw_addr"]),
-                *[f"{v:.4f}" for v in cells],
-                f"{spread_mv:.1f}",
-                f"{mean:.4f}",
-                f"{data['module_v']:.3f}",
-                "—" if math.isnan(t1) else f"{t1:.1f}",
-                "—" if math.isnan(t2) else f"{t2:.1f}",
-                entry["label"],
-                entry["serial"],
-            ]
-
-            for col_i, val in enumerate(col_vals):
-                it = cell_item(val)
-                # only label/serial columns are editable
-                if col_i < len(self.LIVE_COLS) - 2:
-                    it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table.setItem(row_i, col_i, it)
-
-            # colour individual cell columns (C1-C6 = cols 2-7)
-            for ci, v in enumerate(cells):
-                dev = (v - mean) * 1000
-                it  = self.table.item(row_i, 2 + ci)
-                if dev < -CRIT_MV:
-                    it.setBackground(QColor("#7f0000"))
-                elif dev < -WARN_MV:
-                    it.setBackground(QColor("#7f4000"))
-                elif dev > HIGH_MV:
-                    it.setBackground(QColor("#0d3b6e"))
-                else:
-                    it.setBackground(QColor("#1e4d2b"))
-
-            # colour spread column (col 8)
-            sp_it = self.table.item(row_i, 8)
-            if spread_mv > SPREAD_WARN:
-                sp_it.setBackground(QColor("#7f4000"))
-
-        self.table.blockSignals(False)
-
-    def _on_table_edit(self, item: QTableWidgetItem):
-        col = item.column()
-        row = item.row()
-        keys = list(self._modules.keys())
-        if row >= len(keys):
-            return
-        key = keys[row]
-        if col == len(self.LIVE_COLS) - 2:   # Label
-            self._modules[key]["label"] = item.text()
-        elif col == len(self.LIVE_COLS) - 1: # Serial
-            self._modules[key]["serial"] = item.text()
-
     # ── Save ──────────────────────────────────────────────────────────────────
-    def _build_csv_row(self, key: tuple) -> dict:
-        entry = self._modules[key]
-        data  = entry["data"]
-        cells = data["cells"]
-        spread = (max(cells) - min(cells)) * 1000
-        avg    = sum(cells) / len(cells)
-        t1, t2 = data["temp1"], data["temp2"]
-        return {
+    def _save_reading(self):
+        if not self._last_data:
+            return
+        label    = self.txt_label.text().strip() or "unlabeled"
+        serial_n = self.txt_serial.text().strip()
+        cells    = self._last_data["cells"]
+        spread   = (max(cells) - min(cells)) * 1000
+        avg      = sum(cells) / len(cells)
+        t1, t2   = self._last_data["temp1"], self._last_data["temp2"]
+
+        row = {
             "timestamp":    datetime.datetime.now().isoformat(timespec="seconds"),
-            "module_label": entry["label"] or "unlabeled",
-            "serial_num":   entry["serial"],
-            "hw_addr":      data["hw_addr"],
+            "module_label": label,
+            "serial_num":   serial_n,
+            "hw_addr":      self._last_data["hw_addr"],
             "cell1_V":      f"{cells[0]:.6f}",
             "cell2_V":      f"{cells[1]:.6f}",
             "cell3_V":      f"{cells[2]:.6f}",
             "cell4_V":      f"{cells[3]:.6f}",
             "cell5_V":      f"{cells[4]:.6f}",
             "cell6_V":      f"{cells[5]:.6f}",
-            "module_V":     f"{data['module_v']:.4f}",
+            "module_V":     f"{self._last_data['module_v']:.4f}",
             "temp1_C":      "nan" if math.isnan(t1) else f"{t1:.2f}",
             "temp2_C":      "nan" if math.isnan(t2) else f"{t2:.2f}",
             "spread_mV":    f"{spread:.2f}",
             "avg_V":        f"{avg:.6f}",
         }
-
-    def _save_selected(self):
-        sel_rows = {idx.row() for idx in self.table.selectedIndexes()}
-        keys = list(self._modules.keys())
-        saved = 0
-        for row_i in sorted(sel_rows):
-            if row_i < len(keys):
-                append_csv(self._build_csv_row(keys[row_i]))
-                saved += 1
-        if saved:
-            self._on_status(f"Saved {saved} module(s) to log.")
-            main = self.window()
-            if hasattr(main, "summary_tab"):
-                main.summary_tab.refresh()
-            QMessageBox.information(self, "Saved", f"Saved {saved} module(s) to log.")
-
-    def _save_all(self):
-        keys = list(self._modules.keys())
-        for key in keys:
-            append_csv(self._build_csv_row(key))
-        self._on_status(f"Saved {len(keys)} module(s) to log.")
+        append_csv(row)
+        msg = f"Saved module '{label}' to log."
+        self._on_status(msg)
         main = self.window()
         if hasattr(main, "summary_tab"):
             main.summary_tab.refresh()
-        QMessageBox.information(self, "Saved", f"Saved {len(keys)} module(s) to log.")
+        QMessageBox.information(self, "Saved", msg)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
