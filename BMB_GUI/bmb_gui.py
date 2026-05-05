@@ -606,8 +606,9 @@ class TestTab(QWidget):
 #  Pack Summary tab
 # ═══════════════════════════════════════════════════════════════════════════════
 class SummaryTab(QWidget):
-    COLS = ["Label", "Serial", "HW Addr", "C1", "C2", "C3", "C4", "C5", "C6",
-            "Spread mV", "Avg V", "Dev mV", "Temp1 °C", "Temp2 °C", "Saved"]
+    COLS = ["Label", "Date / Time", "Serial", "HW Addr",
+            "C1", "C2", "C3", "C4", "C5", "C6",
+            "Spread mV", "Avg V", "Dev mV", "Temp1 °C", "Temp2 °C"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -693,6 +694,15 @@ class SummaryTab(QWidget):
             f"Avg spread: {sum(spread_all)/len(spread_all):.1f} mV" if spread_all else ""
         )
 
+        # Sort rows by label then timestamp so same module's readings are grouped
+        rows.sort(key=lambda r: (r.get("module_label", "").lower(),
+                                  r.get("timestamp", "")))
+
+        # Re-derive best/worst after sort
+        valid = [(i, float(r["avg_V"])) for i, r in enumerate(rows) if r.get("avg_V")]
+        best_idx  = max(valid, key=lambda x: x[1])[0] if valid else -1
+        worst_idx = min(valid, key=lambda x: x[1])[0] if valid else -1
+
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
 
@@ -717,8 +727,17 @@ class SummaryTab(QWidget):
                     cells_v.append(0.0)
             cell_mean = sum(cells_v) / len(cells_v) if cells_v else avg_v
 
+            # Format timestamp as "YYYY-MM-DD HH:MM" — readable at a glance
+            ts_raw = r.get("timestamp", "")
+            try:
+                ts = datetime.datetime.fromisoformat(ts_raw).strftime("%Y-%m-%d  %H:%M")
+            except ValueError:
+                ts = ts_raw
+
+            # Columns: Label, Date/Time, Serial, HW Addr, C1-C6, Spread, Avg, Dev, T1, T2
             col_data = [
                 r.get("module_label", ""),
+                ts,
                 r.get("serial_num", ""),
                 r.get("hw_addr", ""),
                 *[f"{v:.4f}" for v in cells_v],
@@ -727,11 +746,9 @@ class SummaryTab(QWidget):
                 f"{dev_mv:+.1f}",
                 r.get("temp1_C", ""),
                 r.get("temp2_C", ""),
-                r.get("timestamp", ""),
             ]
             for col_i, val in enumerate(col_data):
-                item = cell(val, Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(row_i, col_i, item)
+                self.table.setItem(row_i, col_i, cell(val))
 
             # Row background for best / worst
             if row_i == best_idx:
@@ -741,9 +758,9 @@ class SummaryTab(QWidget):
             else:
                 row_color = None
 
-            # Per-cell coloring in C1-C6 columns (cols 3-8)
+            # Per-cell coloring — C1-C6 are now cols 4-9
             for ci, v in enumerate(cells_v):
-                item = self.table.item(row_i, 3 + ci)
+                item = self.table.item(row_i, 4 + ci)
                 dev = (v - cell_mean) * 1000
                 if dev < -CRIT_MV:
                     bg = QColor("#7f0000")
@@ -760,18 +777,18 @@ class SummaryTab(QWidget):
 
             # Apply row color to non-cell columns
             if row_color:
-                for col_i in [0, 1, 2, 9, 10, 11, 12, 13, 14]:
+                for col_i in [0, 1, 2, 3, 10, 11, 12, 13, 14]:
                     it = self.table.item(row_i, col_i)
                     if it:
                         it.setBackground(row_color)
 
-            # Color spread column
-            sp_item = self.table.item(row_i, 9)
+            # Spread column is now col 10
+            sp_item = self.table.item(row_i, 10)
             if sp_item and spread > SPREAD_WARN:
                 sp_item.setBackground(QColor("#7f4000"))
 
-            # Color dev column
-            dev_item = self.table.item(row_i, 11)
+            # Dev column is now col 12
+            dev_item = self.table.item(row_i, 12)
             if dev_item:
                 if dev_mv < -CRIT_MV:
                     dev_item.setBackground(QColor("#7f0000"))
