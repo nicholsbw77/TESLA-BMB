@@ -385,10 +385,12 @@ class TestTab(QWidget):
         self.txt_label = QLineEdit()
         self.txt_label.setPlaceholderText("e.g. M05  or  spare-1")
         self.txt_label.setMinimumWidth(130)
+        self.txt_label.textEdited.connect(self._on_label_edited)
 
         self.txt_serial = QLineEdit()
         self.txt_serial.setPlaceholderText("serial / part number (optional)")
         self.txt_serial.setMinimumWidth(200)
+        self.txt_serial.textEdited.connect(self._on_serial_edited)
 
         id_lay.addWidget(QLabel("Label:"))
         id_lay.addWidget(self.txt_label)
@@ -501,6 +503,16 @@ class TestTab(QWidget):
         if self.txt_label.text() == "" and addrs:
             self.txt_label.setText(f"addr{addrs[0]}")
 
+    def _on_label_edited(self, text: str):
+        """User typed in the label field — push to _modules immediately."""
+        for key, entry in self._modules.items():
+            entry["label"] = text
+
+    def _on_serial_edited(self, text: str):
+        """User typed in the serial field — push to _modules immediately."""
+        for key, entry in self._modules.items():
+            entry["serial"] = text
+
     def _on_data(self, port: str, data: dict):
         self._last_data = data
         cells = data["cells"]
@@ -520,14 +532,14 @@ class TestTab(QWidget):
         self.lbl_temp1.setText("—" if math.isnan(t1) else f"{t1:.1f} °C")
         self.lbl_temp2.setText("—" if math.isnan(t2) else f"{t2:.1f} °C")
 
-        # keep shared state for BalanceTab
+        # update shared module state — never touch txt_label/txt_serial here
         key = (port, data["hw_addr"])
         existing = self._modules.get(key, {})
         self._modules[key] = {
             "port":     port,
             "data":     data,
-            "label":    self.txt_label.text().strip() or existing.get("label", f"addr{data['hw_addr']}"),
-            "serial":   self.txt_serial.text().strip() or existing.get("serial", ""),
+            "label":    existing.get("label", f"addr{data['hw_addr']}"),
+            "serial":   existing.get("serial", ""),
             "bal_mask": existing.get("bal_mask", 0),
         }
         main = self.window()
