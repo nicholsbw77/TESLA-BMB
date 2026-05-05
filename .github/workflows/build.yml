@@ -1,0 +1,67 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [master, claude/setup-local-testing-Qx5hQ]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        run: >
+          pyinstaller
+          --onefile
+          --windowed
+          --name "TeslaBMBMonitor"
+          --paths .
+          --hidden-import serial.tools.list_ports
+          --hidden-import PyQt6.sip
+          bmb_gui.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TeslaBMBMonitor-windows
+          path: dist/TeslaBMBMonitor.exe
+          if-no-files-found: error
+
+      # Only create a GitHub Release when a version tag (v*) is pushed
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Tesla BMB Monitor ${{ github.ref_name }}
+          body: |
+            ## Tesla BMB Module Monitor ${{ github.ref_name }}
+
+            ### Download
+            - **TeslaBMBMonitor.exe** — Windows standalone executable, no Python install required
+
+            ### Usage
+            1. Download `TeslaBMBMonitor.exe`
+            2. Plug in your FTDI adapter
+            3. Double-click to run — select your COM port and connect
+
+            ### What's in this release
+            See the [commit history](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for changes.
+          files: dist/TeslaBMBMonitor.exe
+          draft: false
+          prerelease: false

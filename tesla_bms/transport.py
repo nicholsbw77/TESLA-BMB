@@ -95,7 +95,9 @@ class BMSTransport:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
             timeout=self.timeout,
-            write_timeout=self.timeout,
+            write_timeout=None,   # blocking write — avoids FTDI clone timeout errors
+            rtscts=False,
+            xonxoff=False,
         )
         # Some FTDI clones need a moment after open before the line is stable.
         time.sleep(0.05)
