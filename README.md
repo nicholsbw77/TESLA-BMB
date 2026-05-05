@@ -2,7 +2,11 @@
 
 A PyQt6 GUI for reading, logging, and balancing Tesla Gen1 (2012–2016) battery modules via FTDI USB-UART adapters at 612,500 baud (BQ76PL536A protocol).
 
-## Quick Start
+## Download (no Python required)
+
+Pre-built Windows executables are attached to every [GitHub Release](https://github.com/nicholsbw77/TESLA-BMB/releases). Download `TeslaBMBMonitor.exe` and double-click — no install needed.
+
+## Run from source
 
 ```bash
 pip install -r requirements.txt
@@ -10,6 +14,17 @@ python bmb_gui.py
 ```
 
 Requires Python 3.10+ and an FTDI USB-Serial adapter wired to the BMB daisy-chain.
+
+## Creating a release
+
+Tag any commit with a version number to trigger an automatic build and publish:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+GitHub Actions will build `TeslaBMBMonitor.exe` and attach it to the release automatically.
 
 ## Branches
 
