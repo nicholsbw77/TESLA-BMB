@@ -18,6 +18,7 @@ import time
 import datetime
 import threading
 
+import queue
 import serial
 import serial.tools.list_ports
 
@@ -67,6 +68,7 @@ C_TEXT    = QColor("#e0e0e0")
 # ═══════════════════════════════════════════════════════════════════════════════
 from tesla_bms.transport import BMSTransport
 from tesla_bms.bms import TeslaBMS
+from tesla_bms.registers import REG_BAL_CTRL, REG_BAL_TIME
 
 CELL_V_FACTOR    = 6.250  / 16383.0
 MODULE_V_FACTOR  = 33.333 / 16383.0
@@ -102,6 +104,15 @@ class BMBBus:
         except Exception:
             pass
 
+    def balance(self, addr: int, mask: int, duration_s: int = 0) -> None:
+        self.transport.write_register(addr, REG_BAL_CTRL, mask & 0x3F)
+        if duration_s > 0:
+            self.transport.write_register(addr, REG_BAL_TIME, min(63, max(1, duration_s // 60)))
+
+    def stop_balance(self, addr: int) -> None:
+        self.transport.write_register(addr, REG_BAL_CTRL, 0x00)
+        self.transport.write_register(addr, REG_BAL_TIME, 0x00)
+
     def wake(self):
         # Broadcast reset wakes everything cleanly
         self.bms.reset_all()
@@ -130,17 +141,54 @@ class BMBBus:
 # ═══════════════════════════════════════════════════════════════════════════════
 class BMBWorker(QThread):
     # data_ready carries port name so the UI can key rows by (port, addr)
-    data_ready   = pyqtSignal(str, dict)
-    status_msg   = pyqtSignal(str)
-    connect_done = pyqtSignal(str, list)  # port, list of hw addrs found
-    error        = pyqtSignal(str, str)   # port, message
+    data_ready       = pyqtSignal(str, dict)
+    status_msg       = pyqtSignal(str)
+    connect_done     = pyqtSignal(str, list)   # port, list of hw addrs found
+    error            = pyqtSignal(str, str)    # port, message
+    balancing_changed = pyqtSignal(str, int, int)  # port, addr, mask
 
     def __init__(self, port: str):
         super().__init__()
-        self.port    = port
-        self.running = False
+        self.port      = port
+        self.running   = False
         self.bus: BMBBus | None = None
         self.addrs: list[int] = []
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._balancing: dict[int, int] = {}   # addr -> active mask
+
+    # ── commands (safe to call from any thread) ───────────────────────────────
+    def cmd_balance(self, addr: int, mask: int, duration_s: int = 0) -> None:
+        self._cmd_queue.put(("balance", addr, mask, duration_s))
+
+    def cmd_stop_balance(self, addr: int) -> None:
+        self._cmd_queue.put(("stop", addr))
+
+    def cmd_stop_all_balance(self) -> None:
+        for addr in list(self._balancing.keys()):
+            self._cmd_queue.put(("stop", addr))
+
+    def _process_commands(self) -> None:
+        while not self._cmd_queue.empty():
+            try:
+                cmd = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+            if cmd[0] == "balance":
+                _, addr, mask, duration_s = cmd
+                try:
+                    self.bus.balance(addr, mask, duration_s)
+                    self._balancing[addr] = mask
+                    self.balancing_changed.emit(self.port, addr, mask)
+                except Exception as e:
+                    self.status_msg.emit(f"[{self.port}] Balance error addr {addr}: {e}")
+            elif cmd[0] == "stop":
+                _, addr = cmd
+                try:
+                    self.bus.stop_balance(addr)
+                    self._balancing[addr] = 0
+                    self.balancing_changed.emit(self.port, addr, 0)
+                except Exception as e:
+                    self.status_msg.emit(f"[{self.port}] Stop-balance error addr {addr}: {e}")
 
     def run(self):
         try:
@@ -164,6 +212,7 @@ class BMBWorker(QThread):
         self.running = True
 
         while self.running:
+            self._process_commands()
             for addr in self.addrs:
                 data = self.bus.read_module(addr)
                 if data:
@@ -175,6 +224,12 @@ class BMBWorker(QThread):
     def stop(self):
         self.running = False
         if self.bus:
+            # stop any active balancing before closing
+            for addr in list(self._balancing.keys()):
+                try:
+                    self.bus.stop_balance(addr)
+                except Exception:
+                    pass
             self.bus.close()
 
 
@@ -405,6 +460,12 @@ class TestTab(QWidget):
             self.btn_save_sel.setEnabled(False)
             self.btn_save_all.setEnabled(False)
 
+    def get_workers(self) -> dict[str, BMBWorker]:
+        return self._workers
+
+    def get_modules(self) -> dict[tuple, dict]:
+        return self._modules
+
     def _start_worker(self, port: str):
         if port in self._workers:
             return
@@ -413,8 +474,18 @@ class TestTab(QWidget):
         w.status_msg.connect(self._on_status)
         w.connect_done.connect(self._on_connected)
         w.error.connect(self._on_error)
+        w.balancing_changed.connect(self._on_balancing_changed)
         self._workers[port] = w
         w.start()
+
+    def _on_balancing_changed(self, port: str, addr: int, mask: int):
+        key = (port, addr)
+        if key in self._modules:
+            self._modules[key]["bal_mask"] = mask
+        # notify balance tab if present
+        main = self.window()
+        if hasattr(main, "balance_tab"):
+            main.balance_tab.on_balancing_changed(port, addr, mask)
 
     def _stop_all_workers(self):
         for w in self._workers.values():
@@ -437,12 +508,16 @@ class TestTab(QWidget):
         key = (port, data["hw_addr"])
         existing = self._modules.get(key, {})
         self._modules[key] = {
-            "port":   port,
-            "data":   data,
-            "label":  existing.get("label", f"{port}-addr{data['hw_addr']}"),
-            "serial": existing.get("serial", ""),
+            "port":    port,
+            "data":    data,
+            "label":   existing.get("label", f"{port}-addr{data['hw_addr']}"),
+            "serial":  existing.get("serial", ""),
+            "bal_mask": existing.get("bal_mask", 0),
         }
         self._refresh_table()
+        main = self.window()
+        if hasattr(main, "balance_tab"):
+            main.balance_tab.refresh_row(port, data["hw_addr"])
 
     def _on_status(self, msg: str):
         window = self.window()
@@ -767,6 +842,251 @@ class SummaryTab(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Balance tab
+# ═══════════════════════════════════════════════════════════════════════════════
+class BalanceTab(QWidget):
+    COLS = ["Port", "HW Addr", "C1", "C2", "C3", "C4", "C5", "C6",
+            "Spread mV", "Avg V", "Balancing Cells", "Label"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(12, 12, 12, 12)
+
+        # ── Settings bar ──────────────────────────────────────────────────────
+        cfg_box = QGroupBox("Balance Settings")
+        cfg_lay = QHBoxLayout(cfg_box)
+
+        cfg_lay.addWidget(QLabel("Threshold (mV):"))
+        self.spin_threshold = QLineEdit("10")
+        self.spin_threshold.setFixedWidth(60)
+        self.spin_threshold.setToolTip("Balance cells this many mV above the minimum")
+        cfg_lay.addWidget(self.spin_threshold)
+        cfg_lay.addSpacing(20)
+
+        cfg_lay.addWidget(QLabel("Timer (min, 0=∞):"))
+        self.spin_timer = QLineEdit("0")
+        self.spin_timer.setFixedWidth(60)
+        self.spin_timer.setToolTip("Auto-stop after N minutes (0 = run until stopped manually)")
+        cfg_lay.addWidget(self.spin_timer)
+        cfg_lay.addStretch()
+
+        self.lbl_cfg_info = QLabel("Connect modules on the Test tab first.")
+        self.lbl_cfg_info.setStyleSheet("color: #90caf9;")
+        cfg_lay.addWidget(self.lbl_cfg_info)
+        root.addWidget(cfg_box)
+
+        # ── Module table ──────────────────────────────────────────────────────
+        tbl_box = QGroupBox("Modules  (select rows, then use buttons below)")
+        tbl_lay = QVBoxLayout(tbl_box)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        tbl_lay.addWidget(self.table)
+        root.addWidget(tbl_box)
+
+        # ── Action buttons ────────────────────────────────────────────────────
+        act_lay = QHBoxLayout()
+
+        self.btn_bal_sel = QPushButton("⚡  Auto-Balance Selected")
+        self.btn_bal_sel.setMinimumHeight(38)
+        self.btn_bal_sel.clicked.connect(self._balance_selected)
+
+        self.btn_stop_sel = QPushButton("■  Stop Selected")
+        self.btn_stop_sel.setMinimumHeight(38)
+        self.btn_stop_sel.clicked.connect(self._stop_selected)
+
+        self.btn_bal_all = QPushButton("⚡  Balance All")
+        self.btn_bal_all.setMinimumHeight(38)
+        self.btn_bal_all.setStyleSheet("background: #1b5e20;")
+        self.btn_bal_all.clicked.connect(self._balance_all)
+
+        self.btn_stop_all = QPushButton("■  Stop All")
+        self.btn_stop_all.setMinimumHeight(38)
+        self.btn_stop_all.setStyleSheet("background: #7f0000;")
+        self.btn_stop_all.clicked.connect(self._stop_all)
+
+        act_lay.addWidget(self.btn_bal_sel)
+        act_lay.addWidget(self.btn_stop_sel)
+        act_lay.addStretch()
+        act_lay.addWidget(self.btn_bal_all)
+        act_lay.addWidget(self.btn_stop_all)
+        root.addLayout(act_lay)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _threshold_mv(self) -> float:
+        try:
+            return float(self.spin_threshold.text())
+        except ValueError:
+            return 10.0
+
+    def _duration_s(self) -> int:
+        try:
+            mins = float(self.spin_timer.text())
+            return int(mins * 60)
+        except ValueError:
+            return 0
+
+    def _test_tab(self):
+        main = self.window()
+        return main.test_tab if hasattr(main, "test_tab") else None
+
+    def _modules(self) -> dict:
+        tt = self._test_tab()
+        return tt.get_modules() if tt else {}
+
+    def _workers(self) -> dict:
+        tt = self._test_tab()
+        return tt.get_workers() if tt else {}
+
+    def _keys_for_selected_rows(self) -> list[tuple]:
+        sel_rows = {idx.row() for idx in self.table.selectedIndexes()}
+        keys = list(self._modules().keys())
+        return [keys[r] for r in sorted(sel_rows) if r < len(keys)]
+
+    # ── Table rendering ───────────────────────────────────────────────────────
+    def refresh_row(self, port: str, addr: int):
+        """Called from TestTab whenever new data arrives for (port, addr)."""
+        modules = self._modules()
+        keys = list(modules.keys())
+        key = (port, addr)
+        if key not in modules:
+            return
+        # ensure row exists
+        if key not in keys:
+            keys.append(key)
+        row_i = keys.index(key)
+        if self.table.rowCount() != len(keys):
+            self.table.setRowCount(len(keys))
+        self._render_row(row_i, key, modules[key])
+        active = sum(1 for e in modules.values() if e.get("bal_mask", 0))
+        self.lbl_cfg_info.setText(
+            f"{len(modules)} module(s) live — {active} balancing"
+        )
+
+    def on_balancing_changed(self, port: str, addr: int, mask: int):
+        """Called when a worker reports a balance state change."""
+        modules = self._modules()
+        keys = list(modules.keys())
+        key = (port, addr)
+        if key in modules and key in keys:
+            self._render_row(keys.index(key), key, modules[key])
+
+    def _render_row(self, row_i: int, key: tuple, entry: dict):
+        self.table.blockSignals(True)
+        data     = entry["data"]
+        cells    = data["cells"]
+        mean     = sum(cells) / len(cells)
+        spread   = (max(cells) - min(cells)) * 1000
+        bal_mask = entry.get("bal_mask", 0)
+
+        balancing_cells = [str(i + 1) for i in range(6) if (bal_mask >> i) & 1]
+        bal_str = ", ".join(balancing_cells) if balancing_cells else "—"
+
+        def mk(text):
+            it = QTableWidgetItem(str(text))
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            return it
+
+        col_vals = [
+            entry["port"],
+            str(data["hw_addr"]),
+            *[f"{v:.4f}" for v in cells],
+            f"{spread:.1f}",
+            f"{mean:.4f}",
+            bal_str,
+            entry.get("label", ""),
+        ]
+        for col_i, val in enumerate(col_vals):
+            it = mk(val)
+            it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row_i, col_i, it)
+
+        # colour cell columns (C1-C6 = cols 2-7)
+        # balancing cells get amber, others use normal spread colouring
+        for ci, v in enumerate(cells):
+            it = self.table.item(row_i, 2 + ci)
+            if (bal_mask >> ci) & 1:
+                it.setBackground(QColor("#7f4000"))  # amber = actively balancing
+            else:
+                dev = (v - mean) * 1000
+                if dev < -CRIT_MV:
+                    it.setBackground(QColor("#7f0000"))
+                elif dev < -WARN_MV:
+                    it.setBackground(QColor("#7f4000"))
+                elif dev > HIGH_MV:
+                    it.setBackground(QColor("#0d3b6e"))
+                else:
+                    it.setBackground(QColor("#1e4d2b"))
+
+        # highlight entire row if any cell is balancing
+        if bal_mask:
+            for col_i in [0, 1, 8, 9, 10, 11]:
+                it = self.table.item(row_i, col_i)
+                if it:
+                    it.setBackground(QColor("#3d2800"))
+
+        self.table.blockSignals(False)
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+    def _do_balance(self, keys: list[tuple]):
+        modules = self._modules()
+        workers = self._workers()
+        threshold = self._threshold_mv()
+        duration_s = self._duration_s()
+        for key in keys:
+            entry = modules.get(key)
+            if not entry:
+                continue
+            port, addr = key
+            worker = workers.get(port)
+            if not worker:
+                continue
+            cells = entry["data"]["cells"]
+            lo = min(cells)
+            mask = 0
+            for i, v in enumerate(cells):
+                if (v - lo) * 1000 >= threshold:
+                    mask |= (1 << i)
+            if mask == 0:
+                self.window().statusBar().showMessage(
+                    f"[{port}] addr {addr}: all cells within threshold — nothing to balance.", 4000
+                )
+                continue
+            worker.cmd_balance(addr, mask, duration_s)
+
+    def _balance_selected(self):
+        self._do_balance(self._keys_for_selected_rows())
+
+    def _balance_all(self):
+        self._do_balance(list(self._modules().keys()))
+
+    def _do_stop(self, keys: list[tuple]):
+        workers = self._workers()
+        for port, addr in keys:
+            w = workers.get(port)
+            if w:
+                w.cmd_stop_balance(addr)
+
+    def _stop_selected(self):
+        self._do_stop(self._keys_for_selected_rows())
+
+    def _stop_all(self):
+        for w in self._workers().values():
+            w.cmd_stop_all_balance()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Main window
 # ═══════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
@@ -778,8 +1098,10 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         self.test_tab    = TestTab(self)
+        self.balance_tab = BalanceTab(self)
         self.summary_tab = SummaryTab(self)
         tabs.addTab(self.test_tab,    "🔌  Test Module")
+        tabs.addTab(self.balance_tab, "⚡  Balance")
         tabs.addTab(self.summary_tab, "📊  Pack Summary")
         self.setCentralWidget(tabs)
 
